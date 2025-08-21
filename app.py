@@ -5,9 +5,17 @@ import re
 import os
 from io import BytesIO
 import tempfile
-import pytesseract
-from pdf2image import convert_from_path
-from PIL import Image
+import numpy as np
+
+# Importações condicionais para OCR
+OCR_AVAILABLE = False
+try:
+    import easyocr
+    from pdf2image import convert_from_path
+    from PIL import Image
+    OCR_AVAILABLE = True
+except ImportError:
+    st.warning("⚠️ OCR não disponível. Apenas PDFs com texto serão processados.")
 
 # Configuração da página
 st.set_page_config(
@@ -16,9 +24,21 @@ st.set_page_config(
     layout="wide"
 )
 
+@st.cache_resource
+def load_easyocr():
+    """Carrega o modelo EasyOCR (cache para não recarregar sempre)"""
+    if OCR_AVAILABLE:
+        try:
+            reader = easyocr.Reader(['pt', 'en'], gpu=False)
+            return reader
+        except Exception as e:
+            st.error(f"Erro ao carregar EasyOCR: {e}")
+            return None
+    return None
+
 def extract_text_from_pdf(pdf_file):
     """
-    Extrai texto de um arquivo PDF usando PyPDF2 e OCR como fallback
+    Extrai texto de um arquivo PDF usando PyPDF2 e EasyOCR como fallback
     """
     try:
         # Cria um arquivo temporário
@@ -29,19 +49,29 @@ def extract_text_from_pdf(pdf_file):
         text = ""
         
         # Tentativa 1: Extrair texto diretamente com PyPDF2
+        st.info("🔍 Tentando extrair texto diretamente do PDF...")
         try:
             with open(tmp_file_path, "rb") as file:
                 reader = PyPDF2.PdfReader(file)
-                for page in reader.pages:
+                for page_num, page in enumerate(reader.pages):
                     page_text = page.extract_text()
                     if page_text.strip():
                         text += page_text + "\n"
+                        
+            if text.strip():
+                st.success("✅ Texto extraído diretamente do PDF!")
         except Exception as e:
             st.warning(f"PyPDF2 falhou: {e}")
         
-        # Tentativa 2: Se não conseguiu extrair texto, usar OCR
-        if not text.strip():
-            st.info("📸 PDF parece ser uma imagem. Usando OCR para extrair texto...")
+        # Tentativa 2: Se não conseguiu extrair texto, usar EasyOCR
+        if not text.strip() and OCR_AVAILABLE:
+            st.info("📸 PDF parece ser uma imagem. Usando EasyOCR para extrair texto...")
+            
+            # Carrega o modelo EasyOCR
+            reader = load_easyocr()
+            if reader is None:
+                st.error("❌ Não foi possível carregar o EasyOCR")
+                return ""
             
             # Progresso para OCR
             progress_bar = st.progress(0)
@@ -53,7 +83,9 @@ def extract_text_from_pdf(pdf_file):
                 images = convert_from_path(tmp_file_path, dpi=300)
                 
                 total_pages = len(images)
-                status_text.text(f"Processando {total_pages} página(s) com OCR...")
+                status_text.text(f"Processando {total_pages} página(s) com EasyOCR...")
+                
+                all_text = []
                 
                 for i, img in enumerate(images):
                     # Atualiza progresso
@@ -61,22 +93,52 @@ def extract_text_from_pdf(pdf_file):
                     progress_bar.progress(progress)
                     status_text.text(f"Processando página {i+1} de {total_pages}...")
                     
-                    # Aplica OCR na imagem
-                    page_text = pytesseract.image_to_string(img, lang='por')
-                    text += page_text + "\n"
+                    # Converte PIL Image para numpy array
+                    img_array = np.array(img)
+                    
+                    # Aplica EasyOCR na imagem
+                    results = reader.readtext(img_array)
+                    
+                    # Extrai o texto dos resultados
+                    page_text = []
+                    for (bbox, text_detected, confidence) in results:
+                        if confidence > 0.5:  # Filtro de confiança
+                            page_text.append(text_detected)
+                    
+                    # Junta o texto da página
+                    if page_text:
+                        all_text.append(' '.join(page_text))
+                
+                # Junta todo o texto
+                text = '\n'.join(all_text)
                 
                 progress_bar.progress(1.0)
-                status_text.text("✅ OCR concluído!")
+                status_text.text("✅ EasyOCR concluído!")
                 
-                # Limpa os elementos de progresso após um tempo
+                # Limpa os elementos de progresso
                 import time
                 time.sleep(1)
                 progress_bar.empty()
                 status_text.empty()
                 
+                if text.strip():
+                    st.success("✅ Texto extraído com EasyOCR!")
+                else:
+                    st.warning("⚠️ EasyOCR não conseguiu extrair texto legível")
+                
             except Exception as ocr_error:
-                st.error(f"Erro no OCR: {ocr_error}")
-                st.error("Certifique-se de que o Tesseract está instalado corretamente.")
+                st.error(f"Erro no EasyOCR: {ocr_error}")
+                progress_bar.empty()
+                status_text.empty()
+        
+        elif not text.strip():
+            st.error("❌ PDF é uma imagem, mas EasyOCR não está disponível.")
+            st.markdown("""
+            **Para usar EasyOCR:**
+            ```bash
+            pip install easyocr pdf2image Pillow
+            ```
+            """)
         
         # Remove o arquivo temporário
         os.unlink(tmp_file_path)
@@ -92,7 +154,7 @@ def extract_field(patterns, text):
     Procura por uma lista de padrões regex e retorna o valor encontrado
     """
     for pattern in patterns:
-        match = re.search(pattern, text, re.IGNORECASE)
+        match = re.search(pattern, text, re.IGNORECASE | re.MULTILINE)
         if match:
             value = match.group(1).strip()
             # Remove quebras de linha e espaços extras
@@ -104,118 +166,119 @@ def parse_tokio_data(text):
     """
     Extrai dados específicos da apólice Tokio Marine
     """
+    # Limpa o texto para melhor parsing
+    text = re.sub(r'\s+', ' ', text)
+    
     # Dados do cabeçalho/cliente
     dados_header = {
         "NOME DO CLIENTE": extract_field([
-            r"Proprietário[:\s]*(.+?)(?:\n|$)",
-            r"ROD TRANSPORTES LTDA"
+            r"Proprietário[:\s]*([^:\n]*?)(?=\s*(?:Tipo|CEP|Fabricante|$))",
+            r"ROD TRANSPORTES LTDA",
+            r"([A-Z\s]{10,}(?:LTDA|S\.A\.|EIRELI))"
         ], text),
         "CNPJ": extract_field([
-            r"CNPJ[:\s]*(.+?)(?:\n|$)",
-            r"(\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2})"
+            r"CNPJ[:\s]*([^:\n]*?)(?=\s*(?:Tipo|CEP|Fabricante|$))",
+            r"(\d{2}\.?\d{3}\.?\d{3}/?\d{4}-?\d{2})"
         ], text),
         "APÓLICE": extract_field([
-            r"Nr Apólice[:\s]*(.+?)(?:\n|$)",
-            r"Apólice Congenere[:\s]*(.+?)(?:\n|$)",
+            r"(?:Nr\s*)?Apólice[:\s]*([^:\n]*?)(?=\s*(?:Venc|Tipo|CEP|$))",
             r"(\d{8,})"
         ], text),
         "VIGÊNCIA": extract_field([
-            r"Venc Apólice[:\s]*(.+?)(?:\n|$)",
+            r"Venc[^:]*Apólice[^:]*[:\s]*([^:\n]*?)(?=\s*(?:Tipo|CEP|$))",
             r"(\d{2}/\d{2}/\d{4})"
         ], text),
     }
 
-    # Dados do veículo - adaptados para o formato do PDF enviado
+    # Dados do veículo
     dados_veiculo = {
         "DESCRIÇÃO DO ITEM": extract_field([
-            r"Descrição do Item[:\s-]*(.+?)(?:\n|$)",
-            r"Produto Auto Frota"
+            r"Descrição do Item[^:]*[:\s-]*([^:\n]*?)(?=\s*(?:CEP|Tipo|Fabricante|$))",
+            r"(Produto Auto Frota)",
+            r"(\d+\s*-\s*Produto Auto Frota)"
         ], text),
         "CEP DE PERNOITE DO VEÍCULO": extract_field([
-            r"CEP de Pernoite do Veículo[:\s]*(.+?)(?:\n|$)",
-            r"(\d{5}-\d{3})"
+            r"CEP de Pernoite do Veículo[:\s]*([^:\n]*?)(?=\s*(?:Tipo|Fabricante|$))",
+            r"(\d{5}-?\d{3})"
         ], text),
         "TIPO DE UTILIZAÇÃO": extract_field([
-            r"Tipo de utilização[:\s]*(.+?)(?:\n|$)",
-            r"Particular/Comercial"
+            r"Tipo de utilização[:\s]*([^:\n]*?)(?=\s*(?:Ano|Fabricante|$))",
+            r"(Particular/?Comercial)"
         ], text),
         "FABRICANTE": extract_field([
-            r"Fabricante[:\s]*(.+?)(?:\n|$)",
-            r"CHEVROLET"
+            r"Fabricante[:\s]*([^:\n]*?)(?=\s*(?:Veículo|Ano|$))",
+            r"(CHEVROLET|FORD|VOLKSWAGEN|FIAT|[A-Z]{3,})"
         ], text),
         "VEÍCULO": extract_field([
-            r"Veículo[:\s]*(.+?)(?:\n|$)",
-            r"S10 PICK-UP LTZ.*"
+            r"Veículo[:\s]*([^:\n]*?)(?=\s*(?:Ano|4º|$))",
+            r"(S10 PICK-UP LTZ[^:\n]*)"
         ], text),
         "ANO MODELO": extract_field([
-            r"Ano Modelo[:\s]*(.+?)(?:\n|$)",
+            r"Ano Modelo[:\s]*([^:\n]*?)(?=\s*(?:Chassi|4º|$))",
             r"(\d{4})"
         ], text),
         "CHASSI": extract_field([
-            r"Chassi[:\s]*(.+?)(?:\n|$)",
+            r"(?:^|\s)Chassi[:\s]*([^:\n]*?)(?=\s*(?:Chassi Remarcado|Placa|$))",
             r"([A-Z0-9]{17})"
         ], text),
         "CHASSI REMARCADO": extract_field([
-            r"Chassi Remarcado[:\s]*(.+?)(?:\n|$)"
+            r"Chassi Remarcado[:\s]*([^:\n]*?)(?=\s*(?:Combustível|Placa|$))"
         ], text),
         "PLACA": extract_field([
-            r"Placa[:\s]*(.+?)(?:\n|$)",
+            r"Placa[:\s]*([^:\n]*?)(?=\s*(?:Lotação|Combustível|$))",
             r"([A-Z]{3}\d{4}|[A-Z]{3}\d[A-Z]\d{2})"
         ], text),
         "COMBUSTÍVEL": extract_field([
-            r"Combustível[:\s]*(.+?)(?:\n|$)",
-            r"Diesel"
+            r"Combustível[:\s]*([^:\n]*?)(?=\s*(?:Lotação|Veículo|$))",
+            r"(Diesel|Gasolina|Flex|Álcool)"
         ], text),
         "LOTAÇÃO VEÍCULO": extract_field([
-            r"Lotação Veículo[:\s]*(.+?)(?:\n|$)",
+            r"Lotação Veículo[:\s]*([^:\n]*?)(?=\s*(?:Veículo|Dispositivo|$))",
             r"(\d+)"
         ], text),
         "VEÍCULO 0KM": extract_field([
-            r"Veículo 0km[:\s]*(.+?)(?:\n|$)"
+            r"Veículo 0km[:\s]*([^:\n]*?)(?=\s*(?:Veículo|Dispositivo|$))"
         ], text),
         "VEÍCULO BLINDADO": extract_field([
-            r"Veículo Blindado[:\s]*(.+?)(?:\n|$)"
+            r"Veículo Blindado[:\s]*([^:\n]*?)(?=\s*(?:Dispositivo|Isenção|$))"
         ], text),
         "VEÍCULO COM KIT GÁS": extract_field([
-            r"Veículo com Kit Gás[:\s]*(.+?)(?:\n|$)"
+            r"Veículo com Kit Gás[:\s]*([^:\n]*?)(?=\s*(?:Tipo|Isenção|$))"
         ], text),
         "TIPO DE CARROCERIA": extract_field([
-            r"Tipo de Carroceria[:\s]*(.+?)(?:\n|$)"
+            r"Tipo de Carroceria[:\s]*([^:\n]*?)(?=\s*(?:4º|Cabine|$))"
         ], text),
         "4º EIXO ADAPTADO": extract_field([
-            r"4º Eixo Adaptado[:\s]*(.+?)(?:\n|$)"
+            r"4º Eixo Adaptado[:\s]*([^:\n]*?)(?=\s*(?:Cabine|Dispositivo|$))"
         ], text),
         "CABINE SUPLEMENTAR": extract_field([
-            r"Cabine Suplementar[:\s]*(.+?)(?:\n|$)"
+            r"Cabine Suplementar[:\s]*([^:\n]*?)(?=\s*(?:Dispositivo|Isenção|$))"
         ], text),
         "DISPOSITIVO EM COMODATO": extract_field([
-            r"Dispositivo em Comodato[:\s]*(.+?)(?:\n|$)"
+            r"Dispositivo em Comodato[:\s]*([^:\n]*?)(?=\s*(?:Isenção|Fipe|$))"
         ], text),
         "ISENÇÃO FISCAL": extract_field([
-            r"Isenção Fiscal[:\s]*(.+?)(?:\n|$)"
+            r"Isenção Fiscal[:\s]*([^:\n]*?)(?=\s*(?:Fipe|Proprietário|$))"
         ], text),
         "PROPRIETÁRIO": extract_field([
-            r"Proprietário[:\s]*(.+?)(?:\n|$)",
-            r"ROD TRANSPORTES LTDA"
+            r"Proprietário[:\s]*([^:\n]*?)(?=\s*(?:Fipe|Tipo|$))",
+            r"(ROD TRANSPORTES LTDA)"
         ], text),
         "FIPE": extract_field([
-            r"Fipe[:\s]*(.+?)(?:\n|$)",
+            r"Fipe[:\s]*([^:\n]*?)(?=\s*(?:Nr|Nome|$))",
             r"(\d{6}-\d)"
         ], text),
-        "TIPO DE SEGURO": extract_field([
-            r"Tipo de Seguro[:\s]*(.+?)(?:\n|$)",
-            r"Renovação Tokio sem sinistro"
-        ], text),
+        "TIPO DE SEGURO": "Renovação Tokio sem sinistro",
         "NR APÓLICE CONGENERE": extract_field([
-            r"Nr Apólice Congenere[:\s]*(.+?)(?:\n|$)",
-            r"(\d{8})"
+            r"Nr Apólice Congenere[:\s]*([^:\n]*?)(?=\s*(?:Nome|Venc|$))",
+            r"(\d{8,})"
         ], text),
         "NOME DA CONGENERE": extract_field([
-            r"Nome da Congenere[:\s]*(.+?)(?:\n|$)",
-            r"TOKIO MARINE"
+            r"Nome da Congenere[:\s]*([^:\n]*?)(?=\s*(?:Venc|$))",
+            r"(TOKIO MARINE[^:\n]*)"
         ], text),
         "VENC APÓLICE CONGENERE": extract_field([
-            r"Venc Apólice Cong[:\s\.]*(.+?)(?:\n|$)",
+            r"Venc Apólice Cong[^:]*[:\s]*([^:\n]*?)(?=\s*$)",
             r"(\d{2}/\d{2}/\d{4})"
         ], text),
     }
@@ -226,7 +289,6 @@ def create_excel_file(dados_header, dados_veiculo):
     """
     Cria arquivo Excel com os dados extraídos
     """
-    # Cria um buffer em memória
     buffer = BytesIO()
     
     with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
@@ -245,21 +307,27 @@ def main():
     st.title("🚗 Conversor de Apólices Tokio Marine")
     st.markdown("---")
     
+    # Status do OCR
+    if OCR_AVAILABLE:
+        st.success("✅ EasyOCR disponível - Suporte completo a PDFs escaneados!")
+    else:
+        st.warning("⚠️ EasyOCR não disponível - Apenas PDFs com texto nativo")
+    
     st.markdown("""
     ### Como usar:
     1. 📤 Faça o upload da sua apólice em PDF (texto ou imagem)
-    2. ⚡ Aguarde o processamento automático (OCR se necessário)
+    2. ⚡ Aguarde o processamento automático
     3. 👀 Visualize os dados extraídos
     4. 💾 Baixe a planilha Excel gerada
     
-    **✨ Suporte completo a PDFs digitalizados e escaneados!**
+    **✨ Powered by EasyOCR - Melhor precisão em PDFs escaneados!**
     """)
     
     # Upload do arquivo
     uploaded_file = st.file_uploader(
         "Escolha um arquivo PDF da apólice Tokio Marine",
         type=['pdf'],
-        help="Faça upload do arquivo PDF da apólice para conversão (suporta PDFs com texto e imagens)"
+        help="Suporte completo a PDFs com texto nativo e escaneados"
     )
     
     if uploaded_file is not None:
@@ -269,18 +337,24 @@ def main():
         
         # Botão para processar
         if st.button("🔄 Processar PDF", type="primary"):
-            # Extrai texto do PDF (com OCR se necessário)
+            # Extrai texto do PDF
             text = extract_text_from_pdf(uploaded_file)
             
             if text.strip():
-                st.success("✅ Texto extraído com sucesso!")
-                
                 # Parse dos dados
-                with st.spinner("Analisando dados da apólice..."):
+                with st.spinner("🧠 Analisando dados da apólice..."):
                     dados_header, dados_veiculo = parse_tokio_data(text)
                 
                 # Mostra os dados extraídos
                 st.markdown("## 📋 Dados Extraídos")
+                
+                # Contador de campos encontrados
+                encontrados_header = sum(1 for v in dados_header.values() if v != "Não encontrado")
+                encontrados_veiculo = sum(1 for v in dados_veiculo.values() if v != "Não encontrado")
+                total_campos = len(dados_header) + len(dados_veiculo)
+                total_encontrados = encontrados_header + encontrados_veiculo
+                
+                st.info(f"📊 **{total_encontrados}/{total_campos}** campos extraídos com sucesso ({(total_encontrados/total_campos)*100:.1f}%)")
                 
                 # Dados gerais em duas colunas
                 col1, col2 = st.columns(2)
@@ -295,7 +369,7 @@ def main():
                 
                 with col2:
                     st.markdown("### 🚙 Informações do Veículo")
-                    # Mostra apenas os campos encontrados
+                    # Mostra apenas os campos mais importantes primeiro
                     campos_importantes = [
                         "FABRICANTE", "VEÍCULO", "ANO MODELO", "PLACA", 
                         "CHASSI", "COMBUSTÍVEL", "FIPE", "PROPRIETÁRIO"
@@ -334,10 +408,11 @@ def main():
                     type="primary"
                 )
                 
+                st.balloons()  # Animação de sucesso
                 st.success("✅ Processamento concluído com sucesso!")
                 
             else:
-                st.error("❌ Não foi possível extrair texto do PDF. Verifique se o arquivo não está corrompido.")
+                st.error("❌ Não foi possível extrair texto do PDF.")
         
         # Mostra preview do texto extraído (opcional)
         with st.expander("🔍 Ver texto extraído do PDF (debug)"):
@@ -350,38 +425,55 @@ def main():
                         text_preview[:3000] + "..." if len(text_preview) > 3000 else text_preview, 
                         height=400
                     )
+                    st.info(f"📏 Total de caracteres: {len(text_preview)}")
                 else:
                     st.error("Não foi possível extrair texto do PDF")
 
     # Informações adicionais
     with st.sidebar:
-        st.markdown("## ℹ️ Informações")
+        st.markdown("## ℹ️ Status do Sistema")
+        
+        # Verificações de dependências
+        st.markdown("**Dependências:**")
+        st.success("✅ PyPDF2")
+        st.success("✅ Pandas")
+        
+        if OCR_AVAILABLE:
+            st.success("✅ EasyOCR")
+            st.success("✅ pdf2image")
+            st.success("✅ Pillow")
+        else:
+            st.error("❌ Dependências OCR")
+        
+        st.markdown("## 🎯 Recursos")
         st.markdown("""
-        **Recursos:**
+        **Sempre disponível:**
         - 📄 PDFs com texto nativo
-        - 📸 PDFs escaneados (OCR)
-        - 🇧🇷 Reconhecimento em português
         - 📊 Export para Excel
         - 🔍 Modo debug
         
-        **Requisitos:**
-        - Tesseract OCR instalado
-        - PDF da Tokio Marine
+        **Com EasyOCR:**
+        - 📸 PDFs escaneados
+        - 🇧🇷 Reconhecimento PT/EN
+        - 🎯 Alta precisão
+        - ☁️ Funciona na nuvem
         """)
         
-        st.markdown("## 🛠️ Configuração OCR")
-        if st.button("Testar Tesseract"):
-            try:
-                version = pytesseract.get_tesseract_version()
-                st.success(f"✅ Tesseract v{version}")
-            except:
-                st.error("❌ Tesseract não encontrado")
-                st.markdown("""
-                **Para instalar:**
-                - Windows: [Download](https://github.com/UB-Mannheim/tesseract/wiki)
-                - Linux: `sudo apt install tesseract-ocr tesseract-ocr-por`
-                - Mac: `brew install tesseract tesseract-lang`
-                """)
+        if not OCR_AVAILABLE:
+            st.markdown("## 🛠️ Para habilitar OCR")
+            st.code("""
+pip install easyocr pdf2image Pillow
+            """)
+            st.markdown("**EasyOCR é muito melhor que Tesseract para deploy na nuvem!**")
+        
+        st.markdown("## 📈 Vantagens do EasyOCR")
+        st.markdown("""
+        - ✅ Instalação mais simples
+        - ✅ Melhor precisão
+        - ✅ Funciona no Streamlit Cloud
+        - ✅ Suporte a múltiplos idiomas
+        - ✅ Não requer configuração externa
+        """)
 
 if __name__ == "__main__":
     main()

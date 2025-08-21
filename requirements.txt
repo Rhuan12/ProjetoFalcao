@@ -2,6 +2,8 @@ streamlit
 PyPDF2
 pandas
 openpyxl
-pytesseract
+easyocr
 pdf2image
 Pillow
+torch
+torchvision
