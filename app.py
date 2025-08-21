@@ -203,10 +203,18 @@ def extract_field(patterns, text):
     for pattern in patterns:
         match = re.search(pattern, text, re.IGNORECASE | re.MULTILINE)
         if match:
-            value = match.group(1).strip()
-            # Remove quebras de linha e espaços extras
-            value = re.sub(r'\s+', ' ', value)
-            return value
+            # Verifica se há grupos de captura
+            if match.groups():
+                value = match.group(1).strip()
+                # Remove quebras de linha e espaços extras
+                value = re.sub(r'\s+', ' ', value)
+                return value
+            else:
+                # Se não há grupo de captura, retorna o match completo
+                value = match.group(0).strip()
+                # Remove quebras de linha e espaços extras
+                value = re.sub(r'\s+', ' ', value)
+                return value
     return "Não encontrado"
 
 def parse_tokio_data(text):
@@ -225,8 +233,10 @@ def parse_tokio_data(text):
         ], text),
         "CNPJ": extract_field([
             r"CNPJ[:\s]*([^:\n]*?)(?=\s*(?:Tipo|CEP|Fabricante|$))",
-            r"(\d{2}\.?\d{3}\.?\d{3}/?\d{4}-?\d{2})"
-        ], text),
+            r"(\d{2}\.?\d{3}\.?\d{3}/?\d{4}-?\d{2})",
+            r"(\d{14})",  # CNPJ só números
+            r"Documento[:\s]*([^:\n]*?)(?=\s*(?:Tipo|CEP|$))",
+            r"CPF/CNPJ[:\s]*([^:\n]*?)(?=
         "APÓLICE": extract_field([
             r"(?:Nr\s*)?Apólice[:\s]*([^:\n]*?)(?=\s*(?:Venc|Tipo|CEP|$))",
             r"(\d{8,})"
