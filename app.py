@@ -5,17 +5,27 @@ import re
 import os
 from io import BytesIO
 import tempfile
-import numpy as np
 
-# Importações condicionais para OCR
+# Tentativa de importação do Tesseract (mais leve que EasyOCR)
 OCR_AVAILABLE = False
+TESSERACT_AVAILABLE = False
+
 try:
-    import easyocr
+    import pytesseract
     from pdf2image import convert_from_path
     from PIL import Image
+    TESSERACT_AVAILABLE = True
     OCR_AVAILABLE = True
 except ImportError:
-    st.warning("⚠️ OCR não disponível. Apenas PDFs com texto serão processados.")
+    # Fallback: tentar EasyOCR só se Tesseract não estiver disponível
+    try:
+        import easyocr
+        from pdf2image import convert_from_path
+        from PIL import Image
+        import numpy as np
+        OCR_AVAILABLE = True
+    except ImportError:
+        pass
 
 # Configuração da página
 st.set_page_config(
@@ -24,12 +34,15 @@ st.set_page_config(
     layout="wide"
 )
 
+# Cache para EasyOCR (se usado)
 @st.cache_resource
 def load_easyocr():
-    """Carrega o modelo EasyOCR (cache para não recarregar sempre)"""
-    if OCR_AVAILABLE:
+    """Carrega o modelo EasyOCR apenas se necessário"""
+    if not TESSERACT_AVAILABLE and OCR_AVAILABLE:
         try:
-            reader = easyocr.Reader(['pt', 'en'], gpu=False)
+            import easyocr
+            # Configuração mais leve
+            reader = easyocr.Reader(['pt'], gpu=False, verbose=False)
             return reader
         except Exception as e:
             st.error(f"Erro ao carregar EasyOCR: {e}")
@@ -38,7 +51,8 @@ def load_easyocr():
 
 def extract_text_from_pdf(pdf_file):
     """
-    Extrai texto de um arquivo PDF usando PyPDF2 e EasyOCR como fallback
+    Extrai texto de um arquivo PDF usando PyPDF2 e OCR como fallback
+    Prioriza Tesseract (mais leve) sobre EasyOCR
     """
     try:
         # Cria um arquivo temporário
@@ -63,80 +77,113 @@ def extract_text_from_pdf(pdf_file):
         except Exception as e:
             st.warning(f"PyPDF2 falhou: {e}")
         
-        # Tentativa 2: Se não conseguiu extrair texto, usar EasyOCR
+        # Tentativa 2: OCR apenas se necessário
         if not text.strip() and OCR_AVAILABLE:
-            st.info("📸 PDF parece ser uma imagem. Usando EasyOCR para extrair texto...")
             
-            # Carrega o modelo EasyOCR
-            reader = load_easyocr()
-            if reader is None:
-                st.error("❌ Não foi possível carregar o EasyOCR")
-                return ""
+            # Prioridade 1: Tesseract (mais leve)
+            if TESSERACT_AVAILABLE:
+                st.info("📸 PDF é imagem. Usando Tesseract OCR...")
+                try:
+                    # Progresso para OCR
+                    progress_bar = st.progress(0)
+                    status_text = st.empty()
+                    
+                    status_text.text("Convertendo PDF para imagens...")
+                    images = convert_from_path(tmp_file_path, dpi=200)  # DPI menor para ser mais rápido
+                    
+                    total_pages = len(images)
+                    all_text = []
+                    
+                    for i, img in enumerate(images):
+                        progress = (i + 1) / total_pages
+                        progress_bar.progress(progress)
+                        status_text.text(f"OCR página {i+1} de {total_pages}...")
+                        
+                        # Tesseract OCR
+                        page_text = pytesseract.image_to_string(img, lang='por')
+                        if page_text.strip():
+                            all_text.append(page_text)
+                    
+                    text = '\n'.join(all_text)
+                    progress_bar.progress(1.0)
+                    status_text.text("✅ Tesseract OCR concluído!")
+                    
+                    import time
+                    time.sleep(1)
+                    progress_bar.empty()
+                    status_text.empty()
+                    
+                except Exception as tesseract_error:
+                    st.warning(f"Tesseract falhou: {tesseract_error}")
+                    text = ""
             
-            # Progresso para OCR
-            progress_bar = st.progress(0)
-            status_text = st.empty()
-            
-            try:
-                # Converte PDF para imagens
-                status_text.text("Convertendo PDF para imagens...")
-                images = convert_from_path(tmp_file_path, dpi=300)
+            # Prioridade 2: EasyOCR como fallback
+            if not text.strip() and not TESSERACT_AVAILABLE:
+                st.warning("⚠️ Usando EasyOCR - Pode demorar no primeiro uso...")
                 
-                total_pages = len(images)
-                status_text.text(f"Processando {total_pages} página(s) com EasyOCR...")
+                # Mostra aviso sobre download de modelos
+                download_warning = st.warning("📥 EasyOCR está baixando modelos. Isso pode demorar alguns minutos na primeira vez...")
                 
-                all_text = []
-                
-                for i, img in enumerate(images):
-                    # Atualiza progresso
-                    progress = (i + 1) / total_pages
-                    progress_bar.progress(progress)
-                    status_text.text(f"Processando página {i+1} de {total_pages}...")
-                    
-                    # Converte PIL Image para numpy array
-                    img_array = np.array(img)
-                    
-                    # Aplica EasyOCR na imagem
-                    results = reader.readtext(img_array)
-                    
-                    # Extrai o texto dos resultados
-                    page_text = []
-                    for (bbox, text_detected, confidence) in results:
-                        if confidence > 0.5:  # Filtro de confiança
-                            page_text.append(text_detected)
-                    
-                    # Junta o texto da página
-                    if page_text:
-                        all_text.append(' '.join(page_text))
-                
-                # Junta todo o texto
-                text = '\n'.join(all_text)
-                
-                progress_bar.progress(1.0)
-                status_text.text("✅ EasyOCR concluído!")
-                
-                # Limpa os elementos de progresso
-                import time
-                time.sleep(1)
-                progress_bar.empty()
-                status_text.empty()
-                
-                if text.strip():
-                    st.success("✅ Texto extraído com EasyOCR!")
-                else:
-                    st.warning("⚠️ EasyOCR não conseguiu extrair texto legível")
-                
-            except Exception as ocr_error:
-                st.error(f"Erro no EasyOCR: {ocr_error}")
-                progress_bar.empty()
-                status_text.empty()
+                reader = load_easyocr()
+                if reader:
+                    try:
+                        download_warning.empty()  # Remove o aviso
+                        
+                        progress_bar = st.progress(0)
+                        status_text = st.empty()
+                        
+                        status_text.text("Convertendo PDF para imagens...")
+                        images = convert_from_path(tmp_file_path, dpi=200)
+                        
+                        total_pages = len(images)
+                        all_text = []
+                        
+                        for i, img in enumerate(images):
+                            progress = (i + 1) / total_pages
+                            progress_bar.progress(progress)
+                            status_text.text(f"EasyOCR página {i+1} de {total_pages}...")
+                            
+                            img_array = np.array(img)
+                            results = reader.readtext(img_array)
+                            
+                            page_text = []
+                            for (bbox, text_detected, confidence) in results:
+                                if confidence > 0.6:  # Filtro de confiança
+                                    page_text.append(text_detected)
+                            
+                            if page_text:
+                                all_text.append(' '.join(page_text))
+                        
+                        text = '\n'.join(all_text)
+                        progress_bar.progress(1.0)
+                        status_text.text("✅ EasyOCR concluído!")
+                        
+                        import time
+                        time.sleep(1)
+                        progress_bar.empty()
+                        status_text.empty()
+                        
+                    except Exception as easyocr_error:
+                        st.error(f"EasyOCR falhou: {easyocr_error}")
+                        download_warning.empty()
         
         elif not text.strip():
-            st.error("❌ PDF é uma imagem, mas EasyOCR não está disponível.")
+            st.error("❌ PDF é uma imagem, mas OCR não está disponível.")
             st.markdown("""
-            **Para usar EasyOCR:**
-            ```bash
-            pip install easyocr pdf2image Pillow
+            **Para habilitar OCR no Streamlit Cloud:**
+            
+            Crie um arquivo `packages.txt` com:
+            ```
+            tesseract-ocr
+            tesseract-ocr-por
+            poppler-utils
+            ```
+            
+            E adicione no `requirements.txt`:
+            ```
+            pytesseract
+            pdf2image
+            Pillow
             ```
             """)
         
@@ -242,18 +289,6 @@ def parse_tokio_data(text):
         "VEÍCULO BLINDADO": extract_field([
             r"Veículo Blindado[:\s]*([^:\n]*?)(?=\s*(?:Dispositivo|Isenção|$))"
         ], text),
-        "VEÍCULO COM KIT GÁS": extract_field([
-            r"Veículo com Kit Gás[:\s]*([^:\n]*?)(?=\s*(?:Tipo|Isenção|$))"
-        ], text),
-        "TIPO DE CARROCERIA": extract_field([
-            r"Tipo de Carroceria[:\s]*([^:\n]*?)(?=\s*(?:4º|Cabine|$))"
-        ], text),
-        "4º EIXO ADAPTADO": extract_field([
-            r"4º Eixo Adaptado[:\s]*([^:\n]*?)(?=\s*(?:Cabine|Dispositivo|$))"
-        ], text),
-        "CABINE SUPLEMENTAR": extract_field([
-            r"Cabine Suplementar[:\s]*([^:\n]*?)(?=\s*(?:Dispositivo|Isenção|$))"
-        ], text),
         "DISPOSITIVO EM COMODATO": extract_field([
             r"Dispositivo em Comodato[:\s]*([^:\n]*?)(?=\s*(?:Isenção|Fipe|$))"
         ], text),
@@ -307,27 +342,35 @@ def main():
     st.title("🚗 Conversor de Apólices Tokio Marine")
     st.markdown("---")
     
-    # Status do OCR
-    if OCR_AVAILABLE:
-        st.success("✅ EasyOCR disponível - Suporte completo a PDFs escaneados!")
-    else:
-        st.warning("⚠️ EasyOCR não disponível - Apenas PDFs com texto nativo")
+    # Status detalhado do sistema
+    st.markdown("### 🔧 Status do Sistema")
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        st.success("✅ PyPDF2 (Texto)")
+    with col2:
+        if TESSERACT_AVAILABLE:
+            st.success("✅ Tesseract (OCR)")
+        elif OCR_AVAILABLE:
+            st.warning("⚠️ EasyOCR (Lento)")
+        else:
+            st.error("❌ OCR indisponível")
+    with col3:
+        st.success("✅ Excel Export")
     
     st.markdown("""
     ### Como usar:
-    1. 📤 Faça o upload da sua apólice em PDF (texto ou imagem)
+    1. 📤 Faça o upload da sua apólice em PDF
     2. ⚡ Aguarde o processamento automático
     3. 👀 Visualize os dados extraídos
     4. 💾 Baixe a planilha Excel gerada
-    
-    **✨ Powered by EasyOCR - Melhor precisão em PDFs escaneados!**
     """)
     
     # Upload do arquivo
     uploaded_file = st.file_uploader(
         "Escolha um arquivo PDF da apólice Tokio Marine",
         type=['pdf'],
-        help="Suporte completo a PDFs com texto nativo e escaneados"
+        help="PDFs com texto são processados instantaneamente. PDFs escaneados requerem OCR."
     )
     
     if uploaded_file is not None:
@@ -354,7 +397,14 @@ def main():
                 total_campos = len(dados_header) + len(dados_veiculo)
                 total_encontrados = encontrados_header + encontrados_veiculo
                 
-                st.info(f"📊 **{total_encontrados}/{total_campos}** campos extraídos com sucesso ({(total_encontrados/total_campos)*100:.1f}%)")
+                # Mostra taxa de sucesso com cores
+                taxa_sucesso = (total_encontrados/total_campos)*100
+                if taxa_sucesso >= 80:
+                    st.success(f"🎯 **{total_encontrados}/{total_campos}** campos extraídos ({taxa_sucesso:.1f}%) - Excelente!")
+                elif taxa_sucesso >= 60:
+                    st.warning(f"⚠️ **{total_encontrados}/{total_campos}** campos extraídos ({taxa_sucesso:.1f}%) - Bom")
+                else:
+                    st.error(f"❌ **{total_encontrados}/{total_campos}** campos extraídos ({taxa_sucesso:.1f}%) - Baixo")
                 
                 # Dados gerais em duas colunas
                 col1, col2 = st.columns(2)
@@ -408,13 +458,14 @@ def main():
                     type="primary"
                 )
                 
-                st.balloons()  # Animação de sucesso
-                st.success("✅ Processamento concluído com sucesso!")
+                if taxa_sucesso >= 80:
+                    st.balloons()  # Animação só se foi muito bem
+                st.success("✅ Processamento concluído!")
                 
             else:
                 st.error("❌ Não foi possível extrair texto do PDF.")
         
-        # Mostra preview do texto extraído (opcional)
+        # Debug - Mostra preview do texto extraído
         with st.expander("🔍 Ver texto extraído do PDF (debug)"):
             if st.button("Extrair texto para visualização"):
                 with st.spinner("Extraindo texto..."):
@@ -429,50 +480,39 @@ def main():
                 else:
                     st.error("Não foi possível extrair texto do PDF")
 
-    # Informações adicionais
+    # Sidebar com informações
     with st.sidebar:
-        st.markdown("## ℹ️ Status do Sistema")
+        st.markdown("## 🛠️ Configuração para Streamlit Cloud")
         
-        # Verificações de dependências
-        st.markdown("**Dependências:**")
-        st.success("✅ PyPDF2")
-        st.success("✅ Pandas")
+        st.markdown("**Para OCR funcionar, crie:**")
         
-        if OCR_AVAILABLE:
-            st.success("✅ EasyOCR")
-            st.success("✅ pdf2image")
-            st.success("✅ Pillow")
-        else:
-            st.error("❌ Dependências OCR")
+        st.markdown("📄 **packages.txt:**")
+        st.code("""tesseract-ocr
+tesseract-ocr-por
+poppler-utils""", language="text")
         
-        st.markdown("## 🎯 Recursos")
+        st.markdown("📄 **requirements.txt:**")
+        st.code("""streamlit
+PyPDF2
+pandas
+openpyxl
+pytesseract
+pdf2image
+Pillow""", language="text")
+        
+        st.markdown("## 📊 Performance")
         st.markdown("""
-        **Sempre disponível:**
-        - 📄 PDFs com texto nativo
-        - 📊 Export para Excel
-        - 🔍 Modo debug
-        
-        **Com EasyOCR:**
-        - 📸 PDFs escaneados
-        - 🇧🇷 Reconhecimento PT/EN
-        - 🎯 Alta precisão
-        - ☁️ Funciona na nuvem
+        **Tesseract:** ⚡ Rápido, leve
+        **EasyOCR:** 🐌 Lento, pesado
+        **PyPDF2:** 🚀 Instantâneo
         """)
         
-        if not OCR_AVAILABLE:
-            st.markdown("## 🛠️ Para habilitar OCR")
-            st.code("""
-pip install easyocr pdf2image Pillow
-            """)
-            st.markdown("**EasyOCR é muito melhor que Tesseract para deploy na nuvem!**")
-        
-        st.markdown("## 📈 Vantagens do EasyOCR")
+        st.markdown("## 💡 Dicas")
         st.markdown("""
-        - ✅ Instalação mais simples
-        - ✅ Melhor precisão
-        - ✅ Funciona no Streamlit Cloud
-        - ✅ Suporte a múltiplos idiomas
-        - ✅ Não requer configuração externa
+        - PDFs com texto: Instantâneo
+        - PDFs escaneados: Requer OCR
+        - Primeira vez com EasyOCR: Muito lento
+        - Use Tesseract quando possível
         """)
 
 if __name__ == "__main__":
