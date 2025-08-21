@@ -5,8 +5,9 @@ import re
 import os
 from io import BytesIO
 import tempfile
+import numpy as np
 
-# Tentativa de importação do Tesseract (mais leve que EasyOCR)
+# Importações condicionais para OCR
 OCR_AVAILABLE = False
 TESSERACT_AVAILABLE = False
 
@@ -203,10 +204,18 @@ def extract_field(patterns, text):
     for pattern in patterns:
         match = re.search(pattern, text, re.IGNORECASE | re.MULTILINE)
         if match:
-            value = match.group(1).strip()
-            # Remove quebras de linha e espaços extras
-            value = re.sub(r'\s+', ' ', value)
-            return value
+            # Verifica se há grupos de captura
+            if match.groups():
+                value = match.group(1).strip()
+                # Remove quebras de linha e espaços extras
+                value = re.sub(r'\s+', ' ', value)
+                return value
+            else:
+                # Se não há grupo de captura, retorna o match completo
+                value = match.group(0).strip()
+                # Remove quebras de linha e espaços extras
+                value = re.sub(r'\s+', ' ', value)
+                return value
     return "Não encontrado"
 
 def parse_tokio_data(text):
@@ -219,102 +228,85 @@ def parse_tokio_data(text):
     # Dados do cabeçalho/cliente
     dados_header = {
         "NOME DO CLIENTE": extract_field([
-            r"Proprietário[:\s]*([^:\n]*?)(?=\s*(?:Tipo|CEP|Fabricante|$))",
-            r"ROD TRANSPORTES LTDA",
-            r"([A-Z\s]{10,}(?:LTDA|S\.A\.|EIRELI))"
+            r"Segurado.*?Razão Social[:\s]*([^:\n]*?)(?=\s*(?:CNPJ|$))",
+            r"ROD TRANSPORTES LTDA.*?Razão Social[:\s]*([^:\n]*?)(?=\s*(?:CNPJ|$))",
+            r"Razão Social[:\s]*([^:\n]*?)(?=\s*(?:CNPJ|$))",
+            r"(ROD TRANSPORTES LTDA)"
         ], text),
         "CNPJ": extract_field([
-            r"CNPJ[:\s]*([^:\n]*?)(?=\s*(?:Tipo|CEP|Fabricante|$))",
-            r"(\d{2}\.?\d{3}\.?\d{3}/?\d{4}-?\d{2})"
+            r"CNPJ[:\s]*([^:\n]*?)(?=\s*(?:Atividade|$))",
+            r"(\d{3}\.\d{3}\.\d{3}/\d{4}-\d{2})",
+            r"(\d{11,14})"
         ], text),
         "APÓLICE": extract_field([
-            r"(?:Nr\s*)?Apólice[:\s]*([^:\n]*?)(?=\s*(?:Venc|Tipo|CEP|$))",
+            r"(?:Nr\s*)?Apólice[:\s]*([^:\n]*?)(?=\s*(?:Negócio|$))",
+            r"Apólice[:\s]*(\d+)",
             r"(\d{8,})"
         ], text),
         "VIGÊNCIA": extract_field([
-            r"Venc[^:]*Apólice[^:]*[:\s]*([^:\n]*?)(?=\s*(?:Tipo|CEP|$))",
-            r"(\d{2}/\d{2}/\d{4})"
+            r"Vigência do Seguro[:\s]*([^:\n]*?)(?=\s*(?:Data|$))",
+            r"(\d{2}/\d{2}/\d{4}\s*até\s*\d{2}/\d{2}/\d{4})"
         ], text),
     }
 
-    # Dados do veículo
+    # Dados do veículo - procura pelos primeiros dados encontrados
     dados_veiculo = {
         "DESCRIÇÃO DO ITEM": extract_field([
-            r"Descrição do Item[^:]*[:\s-]*([^:\n]*?)(?=\s*(?:CEP|Tipo|Fabricante|$))",
-            r"(Produto Auto Frota)",
-            r"(\d+\s*-\s*Produto Auto Frota)"
+            r"Descrição do Item[^:]*[:\s-]*([^:\n]*?)(?=\s*(?:CEP|$))",
+            r"(Produto Auto Frota)"
         ], text),
         "CEP DE PERNOITE DO VEÍCULO": extract_field([
-            r"CEP de Pernoite do Veículo[:\s]*([^:\n]*?)(?=\s*(?:Tipo|Fabricante|$))",
+            r"CEP de Pernoite do Veículo[:\s]*([^:\n]*?)(?=\s*(?:Fabricante|$))",
             r"(\d{5}-?\d{3})"
         ], text),
         "TIPO DE UTILIZAÇÃO": extract_field([
-            r"Tipo de utilização[:\s]*([^:\n]*?)(?=\s*(?:Ano|Fabricante|$))",
+            r"Tipo de utilização[:\s]*([^:\n]*?)(?=\s*(?:Veículo|$))",
             r"(Particular/?Comercial)"
         ], text),
         "FABRICANTE": extract_field([
-            r"Fabricante[:\s]*([^:\n]*?)(?=\s*(?:Veículo|Ano|$))",
-            r"(CHEVROLET|FORD|VOLKSWAGEN|FIAT|[A-Z]{3,})"
+            r"Fabricante[:\s]*([^:\n]*?)(?=\s*(?:Veículo|$))",
+            r"(CHEVROLET|FORD|VOLKSWAGEN|FIAT|NISSAN|TOYOTA|BYD|MITSUBISHI)"
         ], text),
         "VEÍCULO": extract_field([
-            r"Veículo[:\s]*([^:\n]*?)(?=\s*(?:Ano|4º|$))",
+            r"Veículo[:\s]*([^:\n]*?)(?=\s*(?:\d{4}|4º|$))",
             r"(S10 PICK-UP LTZ[^:\n]*)"
         ], text),
         "ANO MODELO": extract_field([
-            r"Ano Modelo[:\s]*([^:\n]*?)(?=\s*(?:Chassi|4º|$))",
+            r"Ano Modelo[:\s]*([^:\n]*?)(?=\s*(?:Chassi|$))",
             r"(\d{4})"
         ], text),
         "CHASSI": extract_field([
-            r"(?:^|\s)Chassi[:\s]*([^:\n]*?)(?=\s*(?:Chassi Remarcado|Placa|$))",
+            r"Chassi[:\s]*([^:\n]*?)(?=\s*(?:Chassi Remarcado|$))",
             r"([A-Z0-9]{17})"
         ], text),
-        "CHASSI REMARCADO": extract_field([
-            r"Chassi Remarcado[:\s]*([^:\n]*?)(?=\s*(?:Combustível|Placa|$))"
-        ], text),
         "PLACA": extract_field([
-            r"Placa[:\s]*([^:\n]*?)(?=\s*(?:Lotação|Combustível|$))",
+            r"Placa[:\s]*([^:\n]*?)(?=\s*(?:Combustível|$))",
             r"([A-Z]{3}\d{4}|[A-Z]{3}\d[A-Z]\d{2})"
         ], text),
         "COMBUSTÍVEL": extract_field([
-            r"Combustível[:\s]*([^:\n]*?)(?=\s*(?:Lotação|Veículo|$))",
-            r"(Diesel|Gasolina|Flex|Álcool)"
+            r"Combustível[:\s]*([^:\n]*?)(?=\s*(?:Lotação|$))",
+            r"(Diesel|Gasolina|Flex|Álcool|Elétrico)"
         ], text),
         "LOTAÇÃO VEÍCULO": extract_field([
-            r"Lotação Veículo[:\s]*([^:\n]*?)(?=\s*(?:Veículo|Dispositivo|$))",
+            r"Lotação Veículo[:\s]*([^:\n]*?)(?=\s*(?:Veículo|$))",
             r"(\d+)"
         ], text),
-        "VEÍCULO 0KM": extract_field([
-            r"Veículo 0km[:\s]*([^:\n]*?)(?=\s*(?:Veículo|Dispositivo|$))"
-        ], text),
-        "VEÍCULO BLINDADO": extract_field([
-            r"Veículo Blindado[:\s]*([^:\n]*?)(?=\s*(?:Dispositivo|Isenção|$))"
-        ], text),
-        "DISPOSITIVO EM COMODATO": extract_field([
-            r"Dispositivo em Comodato[:\s]*([^:\n]*?)(?=\s*(?:Isenção|Fipe|$))"
-        ], text),
-        "ISENÇÃO FISCAL": extract_field([
-            r"Isenção Fiscal[:\s]*([^:\n]*?)(?=\s*(?:Fipe|Proprietário|$))"
-        ], text),
         "PROPRIETÁRIO": extract_field([
-            r"Proprietário[:\s]*([^:\n]*?)(?=\s*(?:Fipe|Tipo|$))",
+            r"Proprietário[:\s]*([^:\n]*?)(?=\s*(?:Fipe|$))",
             r"(ROD TRANSPORTES LTDA)"
         ], text),
         "FIPE": extract_field([
-            r"Fipe[:\s]*([^:\n]*?)(?=\s*(?:Nr|Nome|$))",
+            r"Fipe[:\s]*([^:\n]*?)(?=\s*(?:Tipo|$))",
             r"(\d{6}-\d)"
         ], text),
         "TIPO DE SEGURO": "Renovação Tokio sem sinistro",
-        "NR APÓLICE CONGENERE": extract_field([
-            r"Nr Apólice Congenere[:\s]*([^:\n]*?)(?=\s*(?:Nome|Venc|$))",
-            r"(\d{8,})"
+        "CLASSE DE BÔNUS": extract_field([
+            r"Classe de Bônus[:\s]*([^:\n]*?)(?=\s*(?:Código|$))",
+            r"(\d+)"
         ], text),
-        "NOME DA CONGENERE": extract_field([
-            r"Nome da Congenere[:\s]*([^:\n]*?)(?=\s*(?:Venc|$))",
-            r"(TOKIO MARINE[^:\n]*)"
-        ], text),
-        "VENC APÓLICE CONGENERE": extract_field([
-            r"Venc Apólice Cong[^:]*[:\s]*([^:\n]*?)(?=\s*$)",
-            r"(\d{2}/\d{2}/\d{4})"
+        "PRÊMIO TOTAL": extract_field([
+            r"Prêmio Total[:\s]*R\$\s*([^:\n]*?)(?=\s*(?:Cobrança|$))",
+            r"R\$\s*([\d.,]+)"
         ], text),
     }
 
