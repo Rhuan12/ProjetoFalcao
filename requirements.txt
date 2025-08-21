@@ -1,4 +1,0 @@
-Dependências do projeto
-
-flask
-PyPDF2
